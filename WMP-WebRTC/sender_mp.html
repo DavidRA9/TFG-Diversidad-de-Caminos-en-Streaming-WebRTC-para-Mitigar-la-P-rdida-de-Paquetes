@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Sender Multipath</title>
+</head>
+<body>
+  <h1>Sender</h1>
+  <video id="video" src="original.mp4" autoplay muted playsinline></video>
+
+  <script>
+	// Creamos dos conexiones RTCPeerConnection, una para cada camino (path1 y path2)
+    // iceServers define el servidor STUN para descubrimiento de IPs públicas.
+    const peer1 = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+    const peer2 = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+    // Original, sin limite de rtx:
+	// const dc1 = peer1.createDataChannel("path1");
+	// const dc2 = peer2.createDataChannel("path2");
+
+	// DataChannels
+	const dc1 = peer1.createDataChannel("path1", {maxRetransmits: 0});
+	const dc2 = peer2.createDataChannel("path2", {maxRetransmits: 0});
+	
+	// WebSocket para señalización con el servidor (ofertas, respuestas, candidatos ICE, y feedback)
+    const ws = new WebSocket("ws://localhost:8765");
+	// Secuencia incremental para numerar cada frame enviado
+    let sequence = 0;
+
+	// Registro de qué canal envió cada secuencia de frame: { seq: "path1" or "path2" }
+    const sentFrames   = {};
+	// Contadores locales de pérdidas reportadas por canal	
+    let lossCounters   = { path1: 0, path2: 0 };
+	// Pesos de ruteo iniciales (50/50)
+    let weights        = { path1: 0.5, path2: 0.5 };
+    
+	// Manejador de mensajes entrantes por WebSocket
+	//añadimos modificación para que cuando llega un mensaje de señalización, diferencie si es el feedback, y lo procese
+    ws.onmessage = async ({ data }) => {
+      
+		try {
+			// Parseamos el JSON recibido
+			const msg = JSON.parse(data);
+			//console.log(`[TRANSMISOR] Mensaje tipo=${msg.type}`);
+			
+			// Si el mensaje es de tipo "feedback", actualizamos pérdidas y recalculamos pesos
+			//Recepcion de feedback con WRR+EWMA
+			if (msg.type === "feedback") {
+				//console.log("Reporte recibido:");
+				//console.log("- Frames perdidos:", msg.lostFrames);
+				
+				// Contamos pérdidas por canal usando filter sobre el array de secuencias perdidas
+				lossCounters.path1 = msg.lostFrames.filter(seq => sentFrames[seq] === "path1").length;
+				lossCounters.path2 = msg.lostFrames.filter(seq => sentFrames[seq] === "path2").length;
+				
+				// Calculamos tasas de pérdida relativas (número perdido / total perdido)
+				const total = lossCounters.path1 + lossCounters.path2 || 1;
+				const rate1 = lossCounters.path1 / total;
+				const rate2 = lossCounters.path2 / total;
+				
+				//Raw weights: inverso de la tasa de pérdida
+				let rawW1 = 1 - rate1;
+				let rawW2 = 1 - rate2;
+				//Normalizamos para que sumen 1
+				const sumRaw = rawW1 + rawW2;
+				rawW1 /= sumRaw;
+				rawW2 /= sumRaw;
+				
+				// --- Suavizado EWMA --- --> https://github.com/jonnieZG/EWMA
+				const α = 0.7;  // factor de suavizado (0 < α ≤ 1), a más alto, más importa la muestra actual(será más reactivo)
+				
+				
+				// Nuevo peso para path1: mezcla entre peso antiguo y rawW1
+				weights.path1 = α * rawW1 + (1 - α) * weights.path1; //La fórumla es -> Salida= alpha * valor_actual + (1-alpha) * ultimo_valor
+				// Calculamos el camino 2 como el contrario al peso recien calculado del path1
+				weights.path2 = 1 - weights.path1;
+				
+				// --- Sin suavizado EWMA ---
+				//const total = lossCounters.path1 + lossCounters.path2 || 1;
+				//const rate1 = lossCounters.path1 / total;
+				//const rate2 = lossCounters.path2 / total;
+				//let w1 = 1 - rate1;
+				//let w2 = 1 - rate2;
+				//const sumW = w1 + w2;
+				//weights.path1 = w1 / sumW;
+				//weights.path2 = w2 / sumW;
+
+				console.log(
+					`Feedback recibido → pérdidas: path1=${lossCounters.path1}, path2=${lossCounters.path2}; ` +
+					`pesos: path1=${weights.path1.toFixed(2)}, path2=${weights.path2.toFixed(2)}`
+				);
+			}
+			else {
+				// Manejo de señalización estándar: answer y candidate
+				// Determinamos el peer según la etiqueta del mensaje
+				
+				const peer = msg.label === "path1" ? peer1 : peer2;
+			  
+				if (msg.type === "answer") {
+					console.log(`[ANSWER ${msg.label}] Configurando descripción remota`);
+					// Aplicamos la descripción remota recibida como respuesta
+					await peer.setRemoteDescription(msg);
+				}
+				else if (msg.type === "candidate") {
+					console.log(`[ICE ${msg.label}] Añadiendo candidato: ${msg.candidate.candidate}`);
+					// Añadimos candidato ICE al peer correspondiente
+					await peer.addIceCandidate(new RTCIceCandidate(msg.candidate));
+				}
+			}
+		} catch (error) {
+			console.error("[TRANSMISOR ERROR]", error);
+		}
+    };
+
+    // Función auxiliar para parsear una línea de candidato ICE, simplemente para ver en consola, sobre todo era para ver el multicamino
+    function parseCandidate(candidate) {
+      const parts = candidate.split(" ");
+      return {
+        ip: parts[4],
+        port: parts[5],
+        type: parts[7]
+      };
+    }
+
+	// Función de negociación: crea oferta, la establece local y la envía por WebSocket
+    async function negotiate(peer, label) {
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      ws.send(JSON.stringify({ type: "offer", sdp: offer.sdp, label }));
+    }
+	
+	// Logs de ICE, detalles usando parseCandidate
+    peer1.onicecandidate = e => {
+      if (e.candidate) {
+        const cand = parseCandidate(e.candidate.candidate);
+        console.log(`[ICE path1] ${cand.ip}:${cand.port} (${cand.type})`);
+      }
+    };
+
+    peer2.onicecandidate = e => {
+      if (e.candidate) {
+        const cand = parseCandidate(e.candidate.candidate);
+        console.log(`[ICE path2] ${cand.ip}:${cand.port} (${cand.type})`);
+      }
+    };
+
+    // Capturamos evento 'play' del video para comenzar a enviar frames
+    const video = document.getElementById("video");
+    video.addEventListener("play", () => {
+		// Creamos un canvas oculto para extraer frames de video
+		const canvas = document.createElement("canvas");
+		const ctx = canvas.getContext("2d");
+		canvas.width = 1920;
+		canvas.height = 1080;
+
+
+
+      function sendFrame() {
+        if (video.paused || video.ended) return;
+		
+		// Dibujamos el frame actual del video en el canvas
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+		// Convertimos el contenido del canvas a Blob WebP
+        canvas.toBlob(blob => {
+			blob.arrayBuffer().then(buffer => {
+				// Cabecera de 4 bytes con número de secuencia (Uint32)
+				const header = new Uint32Array([sequence]);
+				// Creamos paquete combinado: cabecera + datos de imagen
+				const combined = new Uint8Array(header.byteLength + buffer.byteLength);
+				combined.set(new Uint8Array(header.buffer), 0);
+				combined.set(new Uint8Array(buffer), header.byteLength);
+				
+				//scheduler de envío con los pesos calculados
+				const rnd = Math.random();
+				const channel = (rnd < weights.path1) ? dc1 : dc2;
+				
+				// Envío solo si el canal está abierto
+				if (channel.readyState === "open") {
+				  channel.send(combined);
+				  // Registramos qué canal envió este frame para contabilizar luego
+				  sentFrames[sequence] = channel.label;  
+				  //console.log(`[ENVÍO] Frame ${sequence} -> ${channel.label}`);
+				}
+				sequence++;
+			});
+        }, "image/webp", 0.6);
+        // Programamos el siguiente envío (30 fps ≈ 33.3 ms)
+        setTimeout(sendFrame, 1000 / 30);
+      }
+      sendFrame();
+    });
+	
+	// Cuando se abre el WebSocket, iniciamos la negociación para ambos caminos
+    ws.onopen = () => {
+      negotiate(peer1, "path1");
+      negotiate(peer2, "path2");
+    };
+
+    
+  </script>
+</body>
+</html>

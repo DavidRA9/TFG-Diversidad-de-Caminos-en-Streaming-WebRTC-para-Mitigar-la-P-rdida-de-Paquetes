@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Receiver Multipath</title>
+</head>
+<body>
+  <h1>Receiver</h1>
+  <!-- Canvas donde se renderizarán los frames de vídeo recibidos -->
+  <canvas id="canvas" width="1920" height="1080"></canvas>
+
+  <script>
+	// Variable para acumular el número total de frames marcados como perdidos
+	let totalLost = 0; 
+	// Obtenemos el elemento canvas y su contexto 2D para dibujar imágenes
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+	
+	// WebSocket para señalización y envío de feedback de frames perdidos
+    const ws = new WebSocket("ws://localhost:8765");
+    
+
+	// Creamos dos RTCPeerConnections, uno por cada camino de datos (path1, path2)
+    // Configuramos un servidor STUN para resolver direcciones públicas
+	
+    const peers = {
+      path1: new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+      }),
+      path2: new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+      })
+    };
+	
+	// Buffer de frames recibidos: mapa de secuencia -> payload (ArrayBuffer)
+    const buffer = new Map();
+	// Secuencia que esperamos dibujar a continuación
+    let expectedSeq = 0;
+    // Un único Set para todos los frames perdidos
+    const lostFrames = new Set();
+	
+
+    // Sistema de grabación
+    const stream = canvas.captureStream(30);
+    const recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+    const chunks = [];
+	
+	// Cada vez que haya datos disponibles, los agregamos al array chunks
+    recorder.ondataavailable = e => chunks.push(e.data);
+	// Al detener la grabación, creamos un blob final y forzamos descarga(a los 121 segundos)
+    recorder.onstop = () => {
+		const blob = new Blob(chunks, { type: "video/webm" });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = "video_final.webm";
+		a.click();
+		console.log(`Total de frames perdidos: ${totalLost}`);
+	  
+    };
+    recorder.start();
+    setTimeout(() => recorder.stop(), 121000);
+
+    // Sistema de feedback, cada x segundos enviamos la lista de frames perdidos
+    setInterval(() => {
+		if (ws.readyState !== WebSocket.OPEN) {
+			console.error("WebSocket no conectado (Estado:", ws.readyState + ")");
+			return;
+		}
+      
+		// Preparamos objeto de feedback con tipo y array ordenado de pérdidas
+		const feedback = {
+			type: "feedback",
+			lostFrames: Array.from(lostFrames).sort((a, b) => a - b)
+		};
+		console.log("Enviando:", JSON.stringify(feedback));
+      
+		try {
+			// Enviamos por WebSocket
+			ws.send(JSON.stringify(feedback));
+			console.log("Report enviado con éxito");
+		} catch (error) {
+			console.error("[FEEDBACK ERROR]", error);
+		}
+		// Limpiamos el conjunto para el siguiente intervalo
+		lostFrames.clear();
+    }, 1500);
+
+    // Configuración de conexiones, cada peer connection aceptará un DataChannel entrante
+    for (const [label, peer] of Object.entries(peers)) {
+		peer.ondatachannel = event => {
+			const channel = event.channel;
+			console.log(`Canal recibido: ${channel.label}`);
+			
+			// Cuando llega un mensaje (frame) por el canal
+			channel.onmessage = ({ data }) => {
+				// Leemos la cabecera de 4 bytes para obtener la secuencia (Uint32, little-endian)
+				const view = new DataView(data);
+				const seq = view.getUint32(0, true);
+				 // El resto de bytes es el payload de imagen
+				const payload = data.slice(4);
+				console.log(`frame ${seq} recibido en ${label}`);
+			  
+				// Si habíamos marcado este frame como perdido, lo quitamos
+				//if (lostFrames.has(seq)) {
+					//console.log(`Frame ${seq} llegó tarde, lo eliminamos de lostFrames`);
+					//lostFrames.delete(seq);
+				//}
+				
+				 // Si es la primera secuencia > 0, inicializamos expectedSeq
+				if (expectedSeq === 0 && seq > 0) expectedSeq = seq;
+				
+				// Si hay huecos en las secuencias (seq > expectedSeq), marcamos las faltantes(que algun frame llegue antes)
+				if (seq > expectedSeq) {      
+					for (let missing = expectedSeq; missing < seq; missing++) {
+						// Solo añadimos si no estuviera ni en buffer ni en lostFrames
+						if (!buffer.has(missing) && !lostFrames.has(missing)) {
+							lostFrames.add(missing);
+							totalLost++;
+						}
+					}
+				}
+				// Guardamos el payload en el buffer
+				buffer.set(seq, payload);
+				// Intentamos renderizar los frames disponibles
+				renderFrames();
+			};
+		};
+		
+		// Envío de candidatos ICE al servidor de señalización
+		peer.onicecandidate = e => {
+			if (e.candidate) {
+			console.log(`[ICE ${label}] Candidato: ${e.candidate.candidate}`);
+			ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate, label }));
+			}
+		};
+		
+		// Al cambiar el estado de ICE, comprobamos si la conexión está lista
+		peer.addEventListener("iceconnectionstatechange", async () => {
+			if (peer.iceConnectionState === "connected") {
+				const stats = await peer.getStats();
+				for (const [id, report] of stats.entries()) {
+					if (report.type === "candidate-pair" && report.state === "succeeded") {
+						const remote = stats.get(report.remoteCandidateId);
+						const local = stats.get(report.localCandidateId);
+
+						console.log(`${label} conectado:`);
+						console.log(`Remoto: ${remote.ip || remote.address}:${remote.port} (${remote.networkType || remote.candidateType})`);
+						console.log(`Local : ${local.ip || local.address}:${local.port} (${local.networkType || local.candidateType})`);
+
+						// Creo filtro para copiar directamente a Clumsy, ya que los puertos van cambiando
+						if (label === "path1" || label === "path2") {
+							const clumsyFilter = `udp and (udp.DstPort == ${local.port} or udp.SrcPort == ${remote.port})`;
+							console.log(`Filtro Clumsy para ${label}: ${clumsyFilter}`);
+						}
+					}
+				}
+			}
+		});
+    }
+
+    // Manejo de mensajes WebSocket(MODIFICADO, añadido try y catch)
+    ws.addEventListener("message", async ({ data }) => {
+		try {
+			const msg = JSON.parse(data);
+			const peer = peers[msg.label];
+        
+			if (msg.type === "offer") {
+				// Oferta recibida: aplicamos descripción remota y respondemos
+				await peer.setRemoteDescription(new RTCSessionDescription(msg));
+				const answer = await peer.createAnswer();
+				await peer.setLocalDescription(answer);
+				ws.send(JSON.stringify({ type: "answer", sdp: answer.sdp, label: msg.label }));
+			}
+			else if (msg.type === "candidate") {
+				// Candidato ICE recibido: lo añadimos al peer correspondiente
+				await peer.addIceCandidate(new RTCIceCandidate(msg.candidate));
+			}
+		} catch (error) {
+			console.error("[RECEPTOR ERROR]", error);
+		}
+    });
+
+	// Si el frame esperado no está, buscamos el siguiente disponible...
+    function renderFrames() {
+		// Si el frame esperado no está disponible, buscamos el siguiente más pequeño
+		if (!buffer.has(expectedSeq)) {
+			const avail = Array.from(buffer.keys());
+			if (avail.length === 0) return;  // No hay frames para mostrar aún
+			const nextSeq = Math.min(...avail);            
+			console.warn(
+			  `Saltando ${nextSeq - expectedSeq} frames perdidos ` +
+			  `(de ${expectedSeq} a ${nextSeq})`
+			);
+			expectedSeq = nextSeq;
+		}
+
+	  // Ahora sí, renderizamos en orden desde expectedSeq
+		while (buffer.has(expectedSeq)) {
+			const blob = new Blob([buffer.get(expectedSeq)], { type: "image/webp" });
+			createImageBitmap(blob).then(bitmap => {
+			  ctx.drawImage(bitmap, 0, 0);
+			});
+			// Eliminamos del buffer y avanzamos la secuencia
+			buffer.delete(expectedSeq);
+			expectedSeq++;
+		}
+	}
+	
+		//Funcion original
+		//function renderFrames() {
+		//  while (buffer.has(expectedSeq)) {
+		//    const blob = new Blob([buffer.get(expectedSeq)], { type: "image/webp" });
+		//    createImageBitmap(blob).then(bitmap => {
+		//      ctx.drawImage(bitmap, 0, 0);
+		//    });
+		//    buffer.delete(expectedSeq);
+		//    expectedSeq++;
+		//  }
+		//}
+	
+	
+	
+
+  </script>
+</body>
+</html>
