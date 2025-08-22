@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Sender Multipath</title>
+</head>
+<body>
+  <h1>Sender</h1>
+  <!-- Elemento de video que reproduce el archivo original en el navegador-->
+  <video id="video" src="original_timed.mp4" autoplay muted playsinline></video>
+
+  <script>
+    // Creamos dos conexiones RTCPeerConnection independientes para enviar por dos rutas
+    const peer1 = new RTCPeerConnection();
+    const peer2 = new RTCPeerConnection();
+
+
+	// const dc1 = peer1.createDataChannel("path1");
+	// const dc2 = peer2.createDataChannel("path2");
+	
+    // Creamos canales de datos para cada "camino" de la conexión
+    const dc1 = peer1.createDataChannel("path1", {         
+  maxRetransmits: 0        
+});
+const dc2 = peer2.createDataChannel("path2", {
+  maxRetransmits: 0
+});
+
+    // WebSocket para señalización (intercambio de ofertas y candidatos ICE)
+    const ws = new WebSocket("ws://localhost:8765");
+
+    // Contador de secuencia para numerar cada frame enviado
+    let sequence = 0;
+
+    /**
+     * Función para registrar y mostrar en consola los candidatos ICE generados
+     * Esto era un intento de ver si conseguía que saliese la ip de alguno de los adaptadores virtuales
+     * 
+     */
+    function logIceCandidates(peer, label) {
+      console.log(`Esperando candidatos ICE para ${label}...`);
+
+      const candidates = [];
+
+      // Cada vez que se genera un candidato ICE, lo registramos
+      peer.addEventListener("icecandidate", event => {
+        if (event.candidate) {
+          candidates.push(event.candidate.candidate);
+		  
+          const parsed = parseCandidate(event.candidate.candidate);
+		  
+          console.log(`[${label}] candidato ICE:`);
+          console.log(`  IP: ${parsed.ip}`);
+          console.log(`  Puerto: ${parsed.port}`);
+         
+        }
+      });
+
+      // Cuando termina de recolectar candidatos, mostramos el total
+      peer.addEventListener("icegatheringstatechange", () => {
+        if (peer.iceGatheringState === "complete") {
+          console.log(`[${label}] Total candidatos generados: ${candidates.length}`);
+        }
+      });
+    }
+
+    /**
+     * Parsea la cadena de un candidato ICE para extraer campos útiles, nuevamente, esto era para ver si se obtenian como candidatos las otras interfaces
+     */
+    function parseCandidate(str) {
+      const parts = str.split(" ");
+      return {
+        foundation: parts[0].split(":")[1],   // Identificador base
+        component: parts[1],                   // Componente (RTP/RTCP)
+        protocol: parts[2],                    // Protocolo (udp, tcp...)
+        priority: parts[3],                    // Prioridad de este candidato
+        ip: parts[4],                          // Dirección IP
+        port: parts[5],                        // Puerto
+        type: parts[7]                         // Tipo de candidato (host, srflx...)
+      };
+    }
+
+    // Llamamos a la función para ambos peers
+    logIceCandidates(peer1, "path1");
+    logIceCandidates(peer2, "path2");
+
+    /**
+     * Espera hasta que el WebSocket esté abierto antes de continuar
+     */
+    function waitForSocketOpen(socket) {
+      return new Promise(resolve => {
+        if (socket.readyState === WebSocket.OPEN) {
+          resolve();
+        } else {
+          socket.addEventListener('open', () => resolve());
+        }
+      });
+    }
+
+    /**
+     * Inicia la negociación de señalización: crea oferta SDP y la envía
+     */
+    async function negotiate(peer, label) {
+      // Creamos la oferta SDP y la fijamos como descripción local
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+
+      // Esperamos a que el WebSocket esté listo y enviamos la oferta
+      await waitForSocketOpen(ws);
+      ws.send(JSON.stringify({ type: "offer", sdp: offer.sdp, label }));
+    }
+
+    // Manejo de mensajes entrantes por WebSocket
+    ws.onmessage = async ({ data }) => {
+      const msg = JSON.parse(data);
+      // Seleccionamos el peer adecuado según la etiqueta recibida
+      const peer = msg.label === "path1" ? peer1 : peer2;
+
+      if (msg.type === "answer") {
+        // Si es respuesta SDP, la fijamos como descripción remota
+        await peer.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: msg.sdp }));
+      } else if (msg.type === "candidate") {
+        // Si es candidato ICE, lo añadimos a la conexión
+        await peer.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      }
+    };
+
+    // Cuando cada peer genera un candidato ICE, lo enviamos por el WebSocket
+    peer1.onicecandidate = async e => {
+      if (e.candidate) {
+        await waitForSocketOpen(ws);
+        ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate, label: "path1" }));
+      }
+    };
+
+    peer2.onicecandidate = async e => {
+      if (e.candidate) {
+        await waitForSocketOpen(ws);
+        ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate, label: "path2" }));
+      }
+    };
+
+    // Obtenemos el elemento de vídeo
+    const video = document.getElementById("video");
+    video.addEventListener("play", () => {
+      // Creamos un canvas para capturar frames del video
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");//esto hace que pueda "pintar" en el canvas, en este caso, imágenes
+      canvas.width = 1920;  // Ancho de la captura
+      canvas.height = 1080;  // Alto de la captura
+	  //Aquí un detalle que no había comentado, a mayor resolución tenga el canvas, más tiempo tardará en ejecutarse la función toBlob, por lo que se enviaran más o menos frames
+
+      /**
+       * Función recursiva que captura y envía un frame cada ~33ms idealmente si está puesto a 30fps
+       */
+      function sendFrame() {
+        // Si el video está en pausa o ha terminado, detenemos la captura
+        if (video.paused || video.ended) return;
+
+        // Dibujamos el frame actual el video en el canvas
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        // Convertimos el contenido del canvas a un blob en formato WebP, ocupa menos, hay varios formatos soportados
+        canvas.toBlob(blob => {
+          blob.arrayBuffer().then(buffer => {
+            // Preparamos el header con el número de secuencia (4 bytes)
+            const header = new Uint32Array([sequence]);
+            const combined = new Uint8Array(header.byteLength + buffer.byteLength);
+            // Insertamos el header y luego los datos del frame
+            combined.set(new Uint8Array(header.buffer), 0);
+            combined.set(new Uint8Array(buffer), header.byteLength);
+
+            const channel = Math.random() < 0.5 ? dc1 : dc2;
+
+            // Verificamos que el canal esté listo para enviar (open)
+            if (channel.readyState === "open") {
+              // Enviamos el paquete combinado por el canal seleccionado
+              channel.send(combined);
+              // Guardamos en qué canal se envió este frame: useful para feedback posterior
+              console.log(`Frame ${sequence} enviado por ${channel.label}`);
+            }
+
+            // Incrementamos el contador para el próximo frame
+            sequence++;
+          });
+        }, "image/webp", 0.6); //aquí podemos ajustar tambien entre 0 y 1 la "calidad" de la imagen generada
+
+        // Programamos el siguiente envío en ~33ms (30fps), podemos ajustarlo
+        setTimeout(sendFrame, 1000 / 30);
+      }
+
+      // Iniciamos el loop de envío de frames
+      sendFrame();
+    });
+
+    // Cuando el WebSocket se conecta, iniciamos la negociación para ambos peers
+    ws.onopen = () => {
+      negotiate(peer1, "path1");
+      negotiate(peer2, "path2");
+    };
+  </script>
+</body>
+</html>

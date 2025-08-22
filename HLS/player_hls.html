@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>HLS.js con estadísticas</title>
+    <style>
+        video {
+            width: 1280px;
+            height: 720px;
+        }
+        #logDisplay {
+            font-family: monospace;
+            white-space: pre-wrap;
+            background: #f0f0f0;
+            padding: 10px;
+            width: 80%;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>HLS.js Player</h1>
+    <video id="video" controls autoplay muted></video>
+    <br>
+    <button id="descargarLog">Descargar log</button>
+    <div id="logDisplay">Log:</div>
+
+    <!-- Cargar HLS.js desde CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script>
+        const video = document.getElementById('video');
+        const logDisplay = document.getElementById('logDisplay');
+        const logs = [];
+
+        function logEvent(text) {
+            logs.push(text);
+            console.log(text);
+            logDisplay.textContent += `\n${text}`;
+        }
+
+        if (Hls.isSupported()) {
+            const hls = new Hls({
+				startLevel: 0,
+                maxBufferLength: 18,
+                maxMaxBufferLength: 18,
+                maxBufferSize: 30 * 1000 * 1000,
+                maxBufferHole: 0.5,
+                lowLatencyMode: false,
+                backBufferLength: 0,
+                fragLoadPolicy: {
+                    default: {
+                        maxTimeToFirstByteMs: 14000,
+                        maxLoadTimeMs: 14000,
+                        timeoutRetry: {
+                            maxNumRetry: 3,
+                            retryDelayMs: 0,
+                            maxRetryDelayMs: 0,
+                        },
+                        errorRetry: {
+                            maxNumRetry: 2,
+                            retryDelayMs: 3000,
+                            maxRetryDelayMs: 15000,
+                            backoff: 'linear',
+                        },
+                    },
+                },
+            });
+
+            hls.loadSource('http://192.168.56.1:1234/Server/master.m3u8');
+            hls.attachMedia(video);
+
+            // Forzar autoplay después de que el manifiesto se haya parseado
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+				
+                video.muted = true;
+                video.play().catch(e => console.warn("Autoplay bloqueado:", e));
+            });
+
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = 'http://192.168.56.1:1234/Server/master.m3u8';
+            video.muted = true;
+            video.addEventListener('canplay', () => {
+                video.play();
+                logEvent(`Reproducción INICIADA a las ${new Date().toISOString()}`);
+            });
+        }
+
+        let inicioRegistrado = false;
+
+		video.addEventListener("playing", () => {
+			if (!inicioRegistrado) {
+				const now = new Date().toISOString();
+				const log = `Reproducción INICIADA a las ${now}`;
+				console.log(log);
+				logs.push(log);
+				inicioRegistrado = true;
+			}
+		});
+
+        video.addEventListener('ended', () => {
+            logEvent(`Reproducción FINALIZADA a las ${new Date().toISOString()}`);
+        });
+
+
+        document.getElementById("descargarLog").addEventListener("click", () => {
+            const blob = new Blob([logs.join("\n")], { type: "text/plain" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "tiempos.txt";
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+    </script>
+</body>
+</html>

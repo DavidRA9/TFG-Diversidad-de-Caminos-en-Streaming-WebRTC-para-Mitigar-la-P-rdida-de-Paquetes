@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Receiver Unipath</title> <!-- Título que aparece en la pestaña del navegador -->
+</head>
+<body>
+  <h1>Receiver</h1> <!-- Encabezado visible en la interfaz -->
+
+  <!-- Canvas donde se mostrarán los frames reconstruidos -->
+  <canvas id="canvas" width="1920" height="1080"></canvas>
+
+  <script>
+  
+	// Contador global de fotogramas perdidos
+    let totalLost = 0;
+    // Conjunto para registrar las secuencias marcadas como perdidas en cada intervalo
+    const lostFrames = new Set();
+	
+    // Obtener referencia al canvas y su contexto de dibujo
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+	
+	
+	// Capturamos el stream del canvas a 30 fps
+    const stream = canvas.captureStream(30);
+    // Creamos un MediaRecorder para WebM
+    const recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+    const chunks = [];
+
+    // Acumula cada fragmento en el array
+    recorder.ondataavailable = e => chunks.push(e.data);
+
+    // Cuando se detiene la grabación, monta el blob y fuerza la descarga
+    recorder.onstop = () => {
+		const blob = new Blob(chunks, { type: "video/webm" });
+		const url  = URL.createObjectURL(blob);
+		const a    = document.createElement("a");
+		a.href     = url;
+		a.download = "video_final_unipath.webm";
+		a.click();
+		console.log(`Total de frames perdidos: ${totalLost}`);
+    };
+
+    // Inicia la grabación tan pronto arranque el script
+    recorder.start();
+    // Detén automáticamente tras 2 minutos (121000 ms)
+    setTimeout(() => recorder.stop(), 121000);
+
+
+    // Conexión WebSocket para intercambiar SDP y ICE candidates
+    const ws = new WebSocket("ws://localhost:8765");
+
+    // Crear conexión WebRTC que recibirá el canal de datos
+    const peer = new RTCPeerConnection();
+
+    // Buffer para almacenar los frames fuera de orden según su número de secuencia
+    const buffer = new Map();
+
+    // Número de secuencia que se espera renderizar
+    let expectedSeq = 0;
+
+    // Al recibir un canal de datos entrante...
+    peer.ondatachannel = event => {
+		const channel = event.channel; // Obtener el canal
+		channel.onmessage = async ({ data }) => {
+        // Extraer el número de secuencia del encabezado (4 bytes)
+        const view = new DataView(data);
+        const seq = view.getUint32(0, true); // little-endian
+
+        // Extraer el resto del buffer que representa la imagen WebP
+        const imageData = data.slice(4);
+
+        // Si es el primer paquete y no empieza en 0, inicializar expectedSeq
+        if (expectedSeq === 0 && seq > 0) {
+          expectedSeq = seq;
+        }
+		
+		if (seq > expectedSeq) {
+			for (let missing = expectedSeq; missing < seq; missing++) {
+				if (!buffer.has(missing) && !lostFrames.has(missing)) {
+					lostFrames.add(missing);
+					totalLost++;
+				}
+			}
+        }
+
+        // Almacenar el paquete recibido por secuencia
+        buffer.set(seq, imageData);
+
+        // Intentar renderizar los frames en orden
+        renderFrames();
+      };
+    };
+
+    // Enviar candidatos ICE al otro peer cuando estén disponibles
+    peer.onicecandidate = e => {
+      if (e.candidate) {
+        ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate, label: "path1" }));
+      }
+    };
+
+    // Manejo de mensajes entrantes del WebSocket
+    ws.addEventListener("message", async ({ data }) => {
+      const msg = JSON.parse(data); // Parsear mensaje JSON
+      if (msg.label !== "path1") return; // Ignorar si no es para esta ruta
+
+      if (msg.type === "offer") {
+        console.log("Oferta recibida:", msg.sdp);
+        // Establecer la descripción remota con la oferta
+        await peer.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: msg.sdp }));
+
+        // Crear y establecer la respuesta local (answer)
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+
+        // Enviar la respuesta por WebSocket
+        ws.send(JSON.stringify({ type: "answer", sdp: answer.sdp, label: "path1" }));
+      } else if (msg.type === "candidate") {
+        // Agregar candidato ICE recibido
+        await peer.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      }
+    });
+
+    // Función para renderizar los frames almacenados en el buffer
+    function renderFrames() {
+		// Si el frame esperado no está disponible, buscamos el siguiente más pequeño
+		if (!buffer.has(expectedSeq)) {
+			const avail = Array.from(buffer.keys());
+			if (avail.length === 0) return;  // No hay frames para mostrar aún
+			const nextSeq = Math.min(...avail);            
+			console.warn(
+			  `Saltando ${nextSeq - expectedSeq} frames perdidos ` +
+			  `(de ${expectedSeq} a ${nextSeq})`
+			);
+			expectedSeq = nextSeq;
+		}
+
+	  // Ahora sí, renderizamos en orden desde expectedSeq
+		while (buffer.has(expectedSeq)) {
+			const blob = new Blob([buffer.get(expectedSeq)], { type: "image/webp" });
+			createImageBitmap(blob).then(bitmap => {
+			  ctx.drawImage(bitmap, 0, 0);
+			});
+			// Eliminamos del buffer y avanzamos la secuencia
+			buffer.delete(expectedSeq);
+			expectedSeq++;
+		}
+	}
+  </script>
+</body>
+</html>

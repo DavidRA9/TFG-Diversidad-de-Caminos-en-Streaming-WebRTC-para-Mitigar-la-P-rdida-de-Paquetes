@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Receiver Multipath</title>
+</head>
+<body>
+  <h1>Receiver</h1>
+  <!-- Canvas donde se dibujarán los frames recibidos -->
+  <canvas id="canvas" width="1920" height="1080"></canvas>
+
+  <script>
+	// Variable para acumular el número total de frames marcados como perdidos
+	let totalLost = 0; 
+    // Obtenemos el elemento canvas y su contexto 2D para dibujar imágenes, esto hace que pueda "pintar" en el canvas, en este caso, imágenes
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    // WebSocket para señalización con el servidor (intercambio de ofertas y candidatos ICE)
+    const ws = new WebSocket("ws://localhost:8765");
+
+    // Creamos dos conexiones RTCPeerConnection independientes para dos rutas (path1 y path2)
+    const peers = {
+      path1: new RTCPeerConnection(),
+      path2: new RTCPeerConnection()
+    };
+
+    // Buffer para almacenar temporalmente los datos de frames por secuencia
+    const buffer = new Map();
+    // Número de secuencia esperado para el siguiente frame a dibujar, irá incrementando
+    let expectedSeq = 0;
+
+    // Grabación automática del canvas: creamos un MediaRecorder que capture el stream del canvas
+    const stream = canvas.captureStream(30); // 30 fps
+    const recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+    const chunks = [];
+
+    // Cada vez que haya datos disponibles, los almacenamos en un array de chunks
+    recorder.ondataavailable = e => chunks.push(e.data);
+    // Cuando la grabación se detenga, construimos un blob y generamos un enlace de descarga
+    recorder.onstop = () => {
+		const blob = new Blob(chunks, { type: "video/webm" });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = "video_final.webm"; // Nombre del archivo resultante
+		a.click();
+		console.log(`Total de frames perdidos: ${totalLost}`);
+    };
+
+    // Iniciamos la grabación y la detenemos automáticamente tras 121 segundos, por seguridad
+    recorder.start();
+    setTimeout(() => recorder.stop(), 121000);
+    
+
+    // Para cada ruta (path1 y path2), configuramos el manejo de canales de datos y ICE
+    for (const [label, peer] of Object.entries(peers)) {
+      // Cuando recibimos un canal de datos desde el otro peer, vamos sacando por consola para ir controlando
+      peer.ondatachannel = event => {
+        const channel = event.channel;
+        console.log(`Canal recibido: ${channel.label}`);
+
+        // Cada vez que llegue un mensaje (frame) por el canal
+        channel.onmessage = ({ data }) => {
+          // Extraemos la secuencia (primeros 4 bytes, en formato little-endian que es como va por la red)
+          const view = new DataView(data); //Permite leer byte a byte
+          const seq = view.getUint32(0, true); //leemos los 4 bytes correspondientes al número de secuencia
+          // El resto de bytes corresponde a la imagen en formato WebP
+          const payload = data.slice(4);
+
+          // Inicializamos expectedSeq en el primer frame recibido
+          if (expectedSeq === 0 && seq > 0) {
+            expectedSeq = seq;
+          }
+
+          // Detectamos secuencias perdidas: si recibimos un seq > expectedSeq
+          if (seq > expectedSeq) {
+            for (let lost = expectedSeq; lost < seq; lost++) {
+              console.log(`Frame perdido: ${lost}`);
+			  totalLost++;
+            }
+          }
+
+          // Guardamos el frame en el buffer según su secuencia
+          buffer.set(seq, payload);
+          // Intentamos dibujar todos los frames disponibles en orden
+          renderFrames();
+        };
+      };
+
+      // Enviamos candidatos ICE al servidor de señalización
+      peer.onicecandidate = e => {
+        if (e.candidate) {
+          ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate, label }));
+        }
+      };
+
+      // Cuando el estado de la conexión cambia a "connected", mostramos la info de la red
+      peer.addEventListener("iceconnectionstatechange", async () => {
+        if (peer.iceConnectionState === "connected") {
+          const stats = await peer.getStats();
+          for (const [id, report] of stats.entries()) {
+            if (report.type === "candidate-pair" && report.state === "succeeded") {
+              const remote = stats.get(report.remoteCandidateId);
+              const local = stats.get(report.localCandidateId);
+
+              console.log(`${label} conectado:`);
+              console.log(`Remoto: ${remote.ip || remote.address}:${remote.port} (${remote.networkType || remote.candidateType})`);
+              console.log(`Local : ${local.ip || local.address}:${local.port} (${local.networkType || local.candidateType})`);
+
+              // Creo filtro para copiar directamente a Clumsy, ya que los puertos van cambiando
+              if (label === "path1" || label === "path2") {
+                const clumsyFilter = `udp and (udp.DstPort == ${local.port} or udp.SrcPort == ${remote.port})`;
+                console.log(`Filtro Clumsy para ${label}: ${clumsyFilter}`);
+              }
+            }
+          }
+        }
+      });
+    }
+
+    // Cuando el servidor de señalización envía mensajes (offer/answer o candidate)
+    ws.addEventListener("message", async ({ data }) => {
+      const msg = JSON.parse(data);
+      const peer = peers[msg.label];
+      if (!peer) return;
+
+      if (msg.type === "offer") {
+        // Si recibimos una oferta, la fijamos y enviamos respuesta (answer)
+        await peer.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: msg.sdp }));
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: "answer", sdp: answer.sdp, label: msg.label }));
+      } else if (msg.type === "candidate") {
+        // Si recibimos candidato ICE, lo añadimos al peer correspondiente
+        await peer.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      }
+    });
+
+	function renderFrames() {
+		//Añadimos esta modificacion
+		if (!buffer.has(expectedSeq)) {
+			const avail = Array.from(buffer.keys());
+			if (avail.length === 0) return;               
+			const nextSeq = Math.min(...avail);            
+			console.warn(
+			  `Saltando ${nextSeq - expectedSeq} frames perdidos ` +
+			  `(de ${expectedSeq} a ${nextSeq})`
+			);
+			expectedSeq = nextSeq;
+		}
+
+	  // Ahora sí, renderizamos en orden desde expectedSeq
+		while (buffer.has(expectedSeq)) {
+			const blob = new Blob([buffer.get(expectedSeq)], { type: "image/webp" });
+			createImageBitmap(blob).then(bitmap => {
+			  ctx.drawImage(bitmap, 0, 0);
+			});
+			buffer.delete(expectedSeq);
+			expectedSeq++;
+		}
+	}
+
+
+
+
+    /**
+     * Función para dibujar frames en secuencia continua
+     * Extrae del buffer mientras haya datos para expectedSeq
+     
+    function renderFrames() {
+      while (buffer.has(expectedSeq)) {
+        const blob = new Blob([buffer.get(expectedSeq)], { type: "image/webp" });
+        createImageBitmap(blob).then(bitmap => {
+          // Dibujamos el frame sobre el canvas
+          ctx.drawImage(bitmap, 0, 0);
+        });
+        // Eliminamos el frame procesado y avanzamos la secuencia
+        buffer.delete(expectedSeq);
+        expectedSeq++;
+      }
+    }
+	*/
+  </script>
+</body>
+</html>

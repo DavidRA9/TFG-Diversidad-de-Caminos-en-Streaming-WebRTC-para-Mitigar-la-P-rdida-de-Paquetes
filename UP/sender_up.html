@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Sender Unipath</title> <!-- Título que aparece en la pestaña del navegador -->
+</head>
+<body>
+  <h1>Sender</h1> <!-- Encabezado visual en la interfaz -->
+
+  <!-- Elemento de video que reproduce un archivo local -->
+  <video id="video" src="original_timed.mp4" autoplay muted playsinline></video>
+
+  <script>
+    // Crear una nueva conexión WebRTC
+    const peer = new RTCPeerConnection();
+
+    // Crear un canal de datos asociado a esa conexión
+    const dc = peer.createDataChannel("path1",{maxRetransmits: 0});
+
+    // Abrir un WebSocket para señalización (intercambio de SDP y ICE candidates)
+    const ws = new WebSocket("ws://localhost:8765");
+
+    // Inicializar contador de secuencia para numerar los frames
+    let sequence = 0;
+
+    // Función auxiliar que espera a que el WebSocket esté completamente conectado
+    function waitForSocketOpen(socket) {
+      return new Promise(resolve => {
+        if (socket.readyState === 1) resolve(); // Si ya está abierto
+        else socket.addEventListener('open', () => resolve()); // Esperar evento 'open'
+      });
+    }
+
+    // Función principal de negociación WebRTC: genera y envía una oferta SDP
+    async function negotiate() {
+      const offer = await peer.createOffer(); // Crear oferta local
+      await peer.setLocalDescription(offer); // Establecerla como descripción local
+      await waitForSocketOpen(ws); // Esperar WebSocket listo
+      // Enviar oferta al receptor con etiqueta "path1"
+      ws.send(JSON.stringify({ type: "offer", sdp: offer.sdp, label: "path1" }));
+    }
+
+    // Manejar mensajes entrantes por WebSocket
+    ws.onmessage = async ({ data }) => {
+      const msg = JSON.parse(data); // Parsear el mensaje JSON
+      if (msg.label !== "path1") return; // Ignorar si no es para esta conexión
+
+      if (msg.type === "answer") {
+        console.log("Answer recibida:", msg.sdp); // Mostrar la respuesta recibida
+        // Establecer respuesta remota como descripción remota
+        await peer.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: msg.sdp }));
+      } else if (msg.type === "candidate") {
+        // Añadir candidato ICE recibido desde el receptor
+        await peer.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      }
+    };
+
+    // Cuando el navegador genera un nuevo ICE candidate, enviarlo por WebSocket
+    peer.onicecandidate = async e => {
+      if (e.candidate) {
+        await waitForSocketOpen(ws);
+        // Enviar candidato con la etiqueta correspondiente
+        ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate, label: "path1" }));
+      }
+    };
+
+    // Seleccionar el elemento <video>
+    const video = document.getElementById("video");
+
+    // Cuando el video comienza a reproducirse...
+    video.addEventListener("play", () => {
+      // Crear un canvas invisible para capturar frames del video
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      canvas.width = 1920; // Establecer resolución del canvas
+      canvas.height = 1080;
+
+      // Función que captura un frame del video y lo envía
+      function sendFrame() {
+        if (video.paused || video.ended) return; // Detener si el video ya no se reproduce
+
+        // Dibujar el frame actual del video sobre el canvas
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        // Convertir el contenido del canvas a un Blob en formato WebP
+        canvas.toBlob(blob => {
+          blob.arrayBuffer().then(buffer => {
+            // Crear un encabezado con el número de secuencia actual
+            const header = new Uint32Array([sequence++]);
+
+            // Combinar encabezado (4 bytes) y la imagen WebP en un solo paquete
+            const combined = new Uint8Array(header.byteLength + buffer.byteLength);
+            combined.set(new Uint8Array(header.buffer), 0); // Añadir encabezado al principio
+            combined.set(new Uint8Array(buffer), header.byteLength); // Añadir imagen después
+
+            // Enviar el paquete si el canal de datos está abierto
+            if (dc.readyState === "open") dc.send(combined);
+          });
+        }, "image/webp", 0.6); // Calidad del WebP = 0.6
+
+        // Llamar de nuevo a esta función para mantener envío a 30 fps
+        setTimeout(sendFrame, 1000 / 30);
+      }
+
+      // Iniciar el ciclo de captura y envío de frames
+      sendFrame();
+    });
+
+    // Iniciar negociación cuando el WebSocket esté abierto
+    ws.onopen = () => negotiate();
+  </script>
+</body>
+</html>
