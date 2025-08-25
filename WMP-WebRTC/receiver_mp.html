@@ -25,7 +25,7 @@
 	
     const peers = {
       path1: new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }] //Realmente no se hace uso de los servidores STUN al estar todo en local
       }),
       path2: new RTCPeerConnection({
         iceServers: [{ urls: "stun:stun.l.google.com:19302" }]

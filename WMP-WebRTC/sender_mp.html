@@ -10,16 +10,14 @@
 
   <script>
 	// Creamos dos conexiones RTCPeerConnection, una para cada camino (path1 y path2)
-    // iceServers define el servidor STUN para descubrimiento de IPs públicas.
+    // Realmente no se hace uso de los servidores STUN al estar todo en local
     const peer1 = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
     });
     const peer2 = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
     });
-    // Original, sin limite de rtx:
-	// const dc1 = peer1.createDataChannel("path1");
-	// const dc2 = peer2.createDataChannel("path2");
+    
 
 	// DataChannels
 	const dc1 = peer1.createDataChannel("path1", {maxRetransmits: 0});
