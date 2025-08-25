@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>receiver</title>
+</head>
+<body>
+  <h1>receiver</h1>
+  <video id="remoteVideo" autoplay playsinline controls></video>
+  <script>
+    const ws = new WebSocket("ws://localhost:8765");
+    const pc = new RTCPeerConnection();
+    const remoteVideo = document.getElementById("remoteVideo");
+    let recorder;
+    let chunks = [];
+
+    ws.onmessage = async ({ data }) => {
+      const msg = JSON.parse(data);
+
+      if (msg.type === "offer") {
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: msg.sdp }));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: "answer", sdp: answer.sdp }));
+      } else if (msg.type === "candidate") {
+        await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        ws.send(JSON.stringify({ type: "candidate", candidate: event.candidate }));
+      }
+    };
+
+    pc.ontrack = (event) => {
+      // Usar o crear un MediaStream si aún no existe
+      let stream = remoteVideo.srcObject;
+      if (!stream) {
+        stream = new MediaStream();
+        remoteVideo.srcObject = stream;
+      }
+
+      stream.addTrack(event.track);
+
+      // Solo iniciar recorder cuando hay video y aún no ha sido creado
+      if (stream.getVideoTracks().length && !recorder) {
+        const track = stream.getVideoTracks()[0];
+        const settings = track.getSettings();
+        console.log("📺 Resolución recibida:", settings.width + "x" + settings.height);
+
+        const mimeType = 'video/webm; codecs="h264"';
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          alert("⚠️ Este navegador no soporta grabación en H.264.");
+          return;
+        }
+
+        recorder = new MediaRecorder(stream, { mimeType });
+        recorder.ondataavailable = e => chunks.push(e.data);
+        recorder.onstop = () => {
+          const blob = new Blob(chunks, { type: 'video/webm' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = 'recibido.webm';
+          a.click();
+        };
+        recorder.start();
+
+        // Detener tras 121 segundos
+        setTimeout(() => recorder.stop(), 121000);
+      }
+    };
+  </script>
+</body>
+</html>

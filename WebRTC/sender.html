@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>sender</title>
+</head>
+<body>
+  <h1>sender</h1>
+  <video id="localVideo" autoplay muted playsinline></video>
+  <script>
+    const ws = new WebSocket("ws://localhost:8765");
+    const config = { iceServers: [] };
+    const options = {
+      optional: [{ googCpuOveruseDetection: false }]
+    };
+    const pc = new RTCPeerConnection(config, options);
+    const localVideo = document.getElementById("localVideo");
+
+    function waitForSocketOpen(socket) {
+      return new Promise((resolve) => {
+        if (socket.readyState === 1) {
+          resolve();
+        } else {
+          socket.addEventListener('open', () => resolve());
+        }
+      });
+    }
+
+    ws.onmessage = async ({ data }) => {
+      const msg = JSON.parse(data);
+      if (msg.type === "answer") {
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: msg.sdp }));
+      } else if (msg.type === "candidate") {
+        await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      }
+    };
+
+    pc.onicecandidate = async (event) => {
+      if (event.candidate) {
+        await waitForSocketOpen(ws);
+        ws.send(JSON.stringify({ type: "candidate", candidate: event.candidate }));
+      }
+    };
+
+    async function start() {
+      const res = await fetch("original_1.mp4");
+      const blob = await res.blob();
+      const videoURL = URL.createObjectURL(blob);
+
+      localVideo.src = videoURL;
+
+      localVideo.addEventListener("playing", async function handler() {
+        localVideo.removeEventListener("playing", handler);
+        const stream = localVideo.captureStream();
+        const videoTrack = stream.getVideoTracks()[0];
+
+        // 1. Forzar resolucion 1080p
+        try {
+          await videoTrack.applyConstraints({ width: { exact: 1920 }, height: { exact: 1080 } });
+          const settings = videoTrack.getSettings();
+          console.log("Resolucion aplicada:", settings.width + "x" + settings.height);
+        } catch (e) {
+          console.warn("No se pudo aplicar resolucion 1080p:", e);
+        }
+
+        // 2. Crear transceiver con parámetros de codificación
+        const transceiver = pc.addTransceiver(videoTrack, {
+          direction: "sendonly",
+          sendEncodings: [{ maxBitrate: 5000000, scaleResolutionDownBy: 1.0 }]
+        });
+
+        // 3. Forzar H.264
+        const codecs = RTCRtpSender.getCapabilities("video").codecs;
+        const h264 = codecs.filter(c => c.mimeType === "video/H264");
+        if (h264.length) {
+          transceiver.setCodecPreferences(h264);
+          console.log("Codec H.264 aplicado.");
+        }
+
+        // 4. Preferir mantener resolución
+        const params = transceiver.sender.getParameters();
+        params.degradationPreference = "maintain-resolution";
+        await transceiver.sender.setParameters(params);
+
+        // 5. Crear oferta y modificar SDP para limitar max-fs / max-mbps
+        let offer = await pc.createOffer();
+        let sdp = offer.sdp;
+
+        // Modificar línea fmtp de H.264
+        sdp = sdp.replace(
+          /a=fmtp:(\d+) .*?\r\n/g,
+          (line, payload) =>
+            `a=fmtp:${payload} profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1;max-fs=8160;max-mbps=244800\r\n`
+        );
+
+        await pc.setLocalDescription({ type: "offer", sdp });
+
+        await waitForSocketOpen(ws);
+        ws.send(JSON.stringify({ type: "offer", sdp }));
+      });
+
+      localVideo.play();
+    }
+
+    ws.onopen = () => {
+      start();
+    };
+  </script>
+</body>
+</html>
