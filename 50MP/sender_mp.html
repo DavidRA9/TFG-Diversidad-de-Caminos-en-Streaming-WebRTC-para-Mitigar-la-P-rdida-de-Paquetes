@@ -7,16 +7,13 @@
 <body>
   <h1>Sender</h1>
   <!-- Elemento de video que reproduce el archivo original en el navegador-->
-  <video id="video" src="original_timed.mp4" autoplay muted playsinline></video>
+  <video id="video" src="original.mp4" autoplay muted playsinline></video>
 
   <script>
     // Creamos dos conexiones RTCPeerConnection independientes para enviar por dos rutas
     const peer1 = new RTCPeerConnection();
     const peer2 = new RTCPeerConnection();
 
-
-	// const dc1 = peer1.createDataChannel("path1");
-	// const dc2 = peer2.createDataChannel("path2");
 	
     // Creamos canales de datos para cada "camino" de la conexión
     const dc1 = peer1.createDataChannel("path1", {         
@@ -32,11 +29,7 @@ const dc2 = peer2.createDataChannel("path2", {
     // Contador de secuencia para numerar cada frame enviado
     let sequence = 0;
 
-    /**
-     * Función para registrar y mostrar en consola los candidatos ICE generados
-     * Esto era un intento de ver si conseguía que saliese la ip de alguno de los adaptadores virtuales
-     * 
-     */
+    
     function logIceCandidates(peer, label) {
       console.log(`Esperando candidatos ICE para ${label}...`);
 
@@ -64,9 +57,7 @@ const dc2 = peer2.createDataChannel("path2", {
       });
     }
 
-    /**
-     * Parsea la cadena de un candidato ICE para extraer campos útiles, nuevamente, esto era para ver si se obtenian como candidatos las otras interfaces
-     */
+    
     function parseCandidate(str) {
       const parts = str.split(" ");
       return {
@@ -84,9 +75,7 @@ const dc2 = peer2.createDataChannel("path2", {
     logIceCandidates(peer1, "path1");
     logIceCandidates(peer2, "path2");
 
-    /**
-     * Espera hasta que el WebSocket esté abierto antes de continuar
-     */
+    
     function waitForSocketOpen(socket) {
       return new Promise(resolve => {
         if (socket.readyState === WebSocket.OPEN) {
@@ -97,9 +86,7 @@ const dc2 = peer2.createDataChannel("path2", {
       });
     }
 
-    /**
-     * Inicia la negociación de señalización: crea oferta SDP y la envía
-     */
+    
     async function negotiate(peer, label) {
       // Creamos la oferta SDP y la fijamos como descripción local
       const offer = await peer.createOffer();
@@ -150,9 +137,7 @@ const dc2 = peer2.createDataChannel("path2", {
       canvas.height = 1080;  // Alto de la captura
 	  //Aquí un detalle que no había comentado, a mayor resolución tenga el canvas, más tiempo tardará en ejecutarse la función toBlob, por lo que se enviaran más o menos frames
 
-      /**
-       * Función recursiva que captura y envía un frame cada ~33ms idealmente si está puesto a 30fps
-       */
+      
       function sendFrame() {
         // Si el video está en pausa o ha terminado, detenemos la captura
         if (video.paused || video.ended) return;
